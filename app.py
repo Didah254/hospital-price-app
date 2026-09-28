@@ -1,5 +1,6 @@
 # =========================================================
 # Hospital Fair Price System - Complete Full Version
+# (Product Price Tracker - prices side-by-side)
 # =========================================================
 
 import streamlit as st
@@ -249,80 +250,106 @@ if menu == "Check Fair Price":
                 )
 
 # -------------------------------------------------
-# PAGE 2: Register Purchase (Searchable Dropdown Version)
+# PAGE 2: Register Purchase (Product Price Tracker)
 # -------------------------------------------------
 elif menu == "Register Purchase":
-    st.subheader("Register / Update Purchase Record")
-    st.caption("Use this page to record the latest price of any product (old or new) from the same supplier or a new supplier.")
+    st.subheader("Register / Update Purchase Records")
+    st.caption("Record every purchase. The tracker below shows each product on one row with successive prices side-by-side.")
 
-    # Combine original products + newly recorded products
     live_history = load_live_history()
-    live_products = []
     if live_history:
         live_df = pd.DataFrame(live_history)
-        live_products = live_df["Description"].unique().tolist()
+    else:
+        live_df = pd.DataFrame(columns=[
+            "Date", "Description", "Supplier", "Category",
+            "Quantity", "Price", "Amount", "Notes", "Registered_On"
+        ])
 
+    live_products = live_df["Description"].unique().tolist() if len(live_df) > 0 else []
     all_products = sorted(list(set(res["all_known_products"] + live_products)))
 
-    # ---------- Product Selection ----------
-    st.markdown("### 1. Select Product")
+    # =====================================================
+    # PRODUCT PRICE TRACKER (one row per product)
+    # =====================================================
+    st.markdown("### Product Price Tracker (prices appear next to each other)")
+
+    if len(live_df) > 0:
+        tracker_rows = []
+        for product in sorted(live_df["Description"].unique()):
+            prod_data = live_df[live_df["Description"] == product].sort_values("Date")
+            row = {"Product": product}
+            for i, (_, rec) in enumerate(prod_data.iterrows(), 1):
+                row[f"Date_{i}"] = rec["Date"]
+                row[f"Supplier_{i}"] = rec["Supplier"]
+                row[f"Qty_{i}"] = rec["Quantity"]
+                row[f"Price_{i}"] = rec["Price"]
+            tracker_rows.append(row)
+
+        tracker_df = pd.DataFrame(tracker_rows)
+        st.dataframe(tracker_df, use_container_width=True)
+
+        st.download_button(
+            "Download Price Tracker (Excel)",
+            data=to_excel_download(tracker_df, "price_tracker.xlsx"),
+            file_name="Product_Price_Tracker.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.info("No purchases recorded yet. Use the form below to add the first records.")
+
+    st.markdown("---")
+
+    # =====================================================
+    # ADD NEW PURCHASE
+    # =====================================================
+    st.markdown("### Add New Purchase (this will appear as the next price column for that product)")
+
     selected_product = st.selectbox(
         "Search and select product",
         options=all_products,
         index=None,
-        placeholder="Type product name to search..."
+        placeholder="Type product name to search...",
+        key="tracker_product"
     )
-
-    new_product = st.text_input("Or type a completely NEW product name (only if not in the list)")
-
+    new_product = st.text_input("Or type a completely NEW product name", key="tracker_new_product")
     product_to_save = new_product.strip().upper() if new_product.strip() else (selected_product.upper().strip() if selected_product else "")
 
     if product_to_save:
-        st.success(f"Product selected: **{product_to_save}**")
+        st.success(f"Product: **{product_to_save}**")
 
-        # ---------- Supplier Selection ----------
-        st.markdown("### 2. Select Supplier")
+        already = 0
+        if len(live_df) > 0:
+            already = len(live_df[live_df["Description"] == product_to_save])
+        st.write(f"This product has been recorded **{already}** time(s). The new price will appear as Price_{already+1}.")
+
         previous_suppliers = []
-
-        # Suppliers from original data
         if product_to_save in res["product_supplier_history"]:
-            previous_suppliers = [row["Supplier"] for row in res["product_supplier_history"][product_to_save]["summary"]]
-
-        # Suppliers from live history
-        if live_history:
-            live_df = pd.DataFrame(live_history)
+            previous_suppliers = [r["Supplier"] for r in res["product_supplier_history"][product_to_save]["summary"]]
+        if len(live_df) > 0:
             live_suppliers = live_df[live_df["Description"] == product_to_save]["Supplier"].unique().tolist()
             previous_suppliers = sorted(list(set(previous_suppliers + live_suppliers)))
 
         if previous_suppliers:
             supplier_options = previous_suppliers + ["-- Add New Supplier --"]
-            selected_supplier = st.selectbox(
-                "Search and select supplier",
-                options=supplier_options,
-                index=None,
-                placeholder="Type supplier name to search..."
-            )
+            selected_supplier = st.selectbox("Select Supplier", options=supplier_options, index=None, key="tracker_supplier")
             if selected_supplier == "-- Add New Supplier --":
-                selected_supplier = st.text_input("Enter NEW Supplier Name")
+                selected_supplier = st.text_input("Enter NEW Supplier Name", key="tracker_new_sup")
         else:
-            selected_supplier = st.text_input("Enter Supplier Name")
+            selected_supplier = st.text_input("Enter Supplier Name", key="tracker_sup_text")
 
-        # ---------- Price, Quantity, Date ----------
-        st.markdown("### 3. Enter Purchase Details")
         col1, col2 = st.columns(2)
         with col1:
-            qty = st.number_input("Quantity *", min_value=1.0, value=1.0, step=1.0)
-            price = st.number_input("Unit Price (KES) *", min_value=0.0, value=0.0, step=0.01)
+            qty = st.number_input("Quantity *", min_value=1.0, value=1.0, step=1.0, key="tracker_qty")
+            price = st.number_input("Unit Price (KES) *", min_value=0.0, value=0.0, step=0.01, key="tracker_price")
         with col2:
-            purchase_date = st.date_input("Date of Purchase", value=datetime.now())
-            category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"])
+            purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
+            category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"], key="tracker_cat")
 
-        notes = st.text_area("Notes (optional)", placeholder="e.g. Urgent order, discount given, etc.")
+        notes = st.text_area("Notes (optional)", key="tracker_notes")
 
-        # ---------- Save Button ----------
-        if st.button("Save Purchase Record", type="primary"):
+        if st.button("Save This Purchase (adds next price column)", type="primary"):
             if not product_to_save or not selected_supplier or price <= 0:
-                st.warning("Please fill in Product, Supplier and a valid Price.")
+                st.warning("Please fill Product, Supplier and a valid Price.")
             else:
                 history = load_live_history()
                 record = {
@@ -338,13 +365,7 @@ elif menu == "Register Purchase":
                 }
                 history.append(record)
                 save_live_history(history)
-
-                st.success("Record saved successfully!")
-                st.write(f"**Product:** {product_to_save}")
-                st.write(f"**Supplier:** {selected_supplier}")
-                st.write(f"**Quantity:** {qty}")
-                st.write(f"**Unit Price:** KES {price:,.2f}")
-                st.write(f"**Date:** {purchase_date.strftime('%Y-%m-%d')}")
+                st.success(f"Saved! {product_to_save} now has {already+1} price record(s). Refresh to see it in the tracker.")
                 st.balloons()
 
 # -------------------------------------------------
