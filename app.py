@@ -10,7 +10,6 @@ from io import BytesIO
 st.set_page_config(page_title="Hospital Fair Price System", page_icon="🏥", layout="wide")
 st.title("Hospital Procurement – Fair Price System")
 
-# Load saved models and data
 @st.cache_resource
 def load_resources():
     base = "price_models"
@@ -53,7 +52,6 @@ def save_live_history(history):
 def predict_fair_price(description, quantity, supplier, month, proposed_price, category="DRUG"):
     description = str(description).upper().strip()
     supplier = str(supplier).upper().strip()
-
     if description in res["low_products"]:
         model = res["model_low"]
         le_desc, le_sup, le_cat = res["le_desc_low"], res["le_sup_low"], res["le_cat_low"]
@@ -68,33 +66,27 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         group = "High-value"
     else:
         return predict_from_history(description, proposed_price)
-
     try:
         desc_enc = le_desc.transform([description])[0]
     except:
         return predict_from_history(description, proposed_price)
-
     try:
         sup_enc = le_sup.transform([supplier])[0]
     except:
         sup_enc = 0
-
     try:
         cat_enc = le_cat.transform([category.upper()])[0]
     except:
         cat_enc = 0
-
     X = np.array([[desc_enc, quantity, month, sup_enc, cat_enc]])
     expected = model.predict(X)[0]
     variance = ((proposed_price - expected) / expected) * 100
-
     if variance > 20:
         status = "HIGH – Review required before approval"
     elif variance > 10:
         status = "MEDIUM – Ask for justification"
     else:
         status = "ACCEPTABLE"
-
     return {
         "Product Group": group,
         "Expected fair price (KES)": round(float(expected), 2),
@@ -108,23 +100,19 @@ def predict_from_history(description, proposed_price):
     history = load_live_history()
     df = pd.DataFrame(history)
     product_df = df[df["Description"] == description]
-
     if len(product_df) < 3:
         return {
             "Message": f"Only {len(product_df)} purchase(s) recorded so far. At least 3 are needed for a reliable estimate.",
             "Recorded prices": product_df["Price"].tolist() if len(product_df) > 0 else []
         }
-
     median_price = product_df["Price"].median()
     variance = ((proposed_price - median_price) / median_price) * 100
-
     if variance > 20:
         status = "HIGH – Review required"
     elif variance > 10:
         status = "MEDIUM – Ask for justification"
     else:
         status = "ACCEPTABLE"
-
     return {
         "Times recorded": len(product_df),
         "Suppliers used": int(product_df["Supplier"].nunique()),
@@ -147,13 +135,11 @@ def show_clean_result(result):
         if result.get("Recorded prices"):
             st.write("Recorded prices so far: " + ", ".join([str(p) for p in result["Recorded prices"]]))
         return
-
     st.markdown("### Result")
     st.write(f"**Product Group:** {result.get('Product Group', 'N/A')}")
     st.write(f"**Expected Fair Price:** KES {result.get('Expected fair price (KES)', result.get('Median price (KES)', 'N/A'))}")
     st.write(f"**Proposed Price:** KES {result.get('Proposed price (KES)', 'N/A')}")
     st.write(f"**Difference:** {result.get('Difference %', 'N/A')}%")
-
     recommendation = result.get("Recommendation", "")
     if "HIGH" in recommendation:
         st.error(f"**Recommendation:** {recommendation}")
@@ -180,33 +166,26 @@ st.markdown("---")
 # PAGE 1: Check Fair Price
 if menu == "Check Fair Price":
     st.subheader("Check Fair Price")
-
     selected_product = st.selectbox(
         "Select Product",
         options=res["all_known_products"],
         index=None,
         placeholder="Type to search or select a product..."
     )
-
     new_product = st.text_input("Or type a new product name (leave empty if you selected above)")
     product_to_use = new_product.strip().upper() if new_product.strip() else selected_product
-
     if product_to_use:
         st.markdown(f"**Selected Product:** {product_to_use}")
-
         if product_to_use in res["product_supplier_history"]:
             summary_df = pd.DataFrame(res["product_supplier_history"][product_to_use]["summary"])
             st.write("**Suppliers who previously supplied this product**")
             st.dataframe(summary_df, use_container_width=True)
-
             supplier_options = summary_df["Supplier"].tolist() + ["-- Add New Supplier --"]
             selected_supplier = st.selectbox("Select Supplier", options=supplier_options, index=None)
-
             if selected_supplier == "-- Add New Supplier --":
                 selected_supplier = st.text_input("Enter new supplier name")
         else:
             selected_supplier = st.text_input("Supplier name")
-
         col1, col2, col3 = st.columns(3)
         with col1:
             quantity = st.number_input("Quantity", min_value=1.0, value=1.0)
@@ -214,7 +193,6 @@ if menu == "Check Fair Price":
             proposed_price = st.number_input("Proposed Price (KES)", min_value=0.0, value=0.0)
         with col3:
             month = st.number_input("Month (1-12)", min_value=1, max_value=12, value=datetime.now().month)
-
         if st.button("Check if Price is Fair", type="primary"):
             if not selected_supplier or proposed_price <= 0:
                 st.warning("Please enter Supplier and Proposed Price.")
@@ -223,7 +201,6 @@ if menu == "Check Fair Price":
                     product_to_use, quantity, selected_supplier, month, proposed_price
                 )
                 show_clean_result(result)
-
                 report_df = pd.DataFrame([result])
                 excel_data = to_excel_download(report_df, "fair_price_report.xlsx")
                 st.download_button(
@@ -246,13 +223,11 @@ elif menu == "Register Purchase":
             "Date", "Description", "Supplier", "Category",
             "Quantity", "Price", "Amount", "Notes", "Registered_On"
         ])
-
     live_products = live_df["Description"].unique().tolist() if len(live_df) > 0 else []
     all_products = sorted(list(set(res["all_known_products"] + live_products)))
 
     # Price Tracker
     st.markdown("### Product Price Tracker")
-
     if len(live_df) > 0:
         tracker_rows = []
         for product in sorted(live_df["Description"].unique()):
@@ -264,10 +239,8 @@ elif menu == "Register Purchase":
                 row[f"Qty_{i}"] = rec["Quantity"]
                 row[f"Price_{i}"] = rec["Price"]
             tracker_rows.append(row)
-
         tracker_df = pd.DataFrame(tracker_rows)
         st.dataframe(tracker_df, use_container_width=True)
-
         st.download_button(
             "Download Price Tracker (Excel)",
             data=to_excel_download(tracker_df, "price_tracker.xlsx"),
@@ -275,13 +248,12 @@ elif menu == "Register Purchase":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.info("No purchases recorded yet. Use the form below to add the first records.")
+        st.info("No purchases recorded yet. Use the form below to add the first ones.")
 
     st.markdown("---")
 
     # Add new purchase
     st.markdown("### Add New Purchase")
-
     selected_product = st.selectbox(
         "Search and select product",
         options=all_products,
@@ -294,7 +266,6 @@ elif menu == "Register Purchase":
 
     if product_to_save:
         st.success(f"Product: **{product_to_save}**")
-
         already = 0
         if len(live_df) > 0:
             already = len(live_df[live_df["Description"] == product_to_save])
@@ -322,7 +293,6 @@ elif menu == "Register Purchase":
         with col2:
             purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
             category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"], key="tracker_cat")
-
         notes = st.text_area("Notes (optional)", key="tracker_notes")
 
         if st.button("Save Purchase", type="primary"):
@@ -345,133 +315,123 @@ elif menu == "Register Purchase":
                 save_live_history(history)
                 st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
                 st.balloons()
+                st.rerun()
 
-    # Edit or Delete
+    # Edit / Delete – only open when you need to fix a mistake
     st.markdown("---")
-    st.markdown("### Edit or Delete Records")
-    st.caption("Use this if you entered something wrongly or when testing.")
+    with st.expander("Fix a mistake (Edit or Delete)", expanded=False):
+        st.warning("Only open this if you entered something wrong. Deleting removes the record for good.")
 
-    history = load_live_history()
-
-    if history:
-        hist_df = pd.DataFrame(history).reset_index().rename(columns={"index": "Row_ID"})
-
-        st.write("**Current records**")
-        st.dataframe(
-            hist_df[["Row_ID", "Date", "Description", "Supplier", "Quantity", "Price", "Category", "Notes"]],
-            use_container_width=True
-        )
-
-        action = st.radio(
-            "What do you want to do?",
-            ["Delete a record", "Edit a record"],
-            horizontal=True,
-            key="edit_delete_action"
-        )
-
-        row_id = st.number_input(
-            "Enter Row_ID",
-            min_value=0,
-            max_value=max(0, len(hist_df) - 1),
-            step=1,
-            key="edit_delete_row_id"
-        )
-
-        if action == "Delete a record":
-            if st.button("Delete This Record"):
-                new_history = [rec for i, rec in enumerate(history) if i != row_id]
-                save_live_history(new_history)
-                st.success(f"Row {row_id} deleted. Switch menu or refresh to see the update.")
-                st.balloons()
-
+        history = load_live_history()
+        if not history:
+            st.info("Nothing to edit or delete yet.")
         else:
-            if 0 <= row_id < len(history):
-                current = history[row_id]
+            hist_df = pd.DataFrame(history).reset_index().rename(columns={"index": "Row_ID"})
+            st.write("**Current records**")
+            st.dataframe(
+                hist_df[["Row_ID", "Date", "Description", "Supplier", "Quantity", "Price", "Category", "Notes"]],
+                use_container_width=True
+            )
 
-                st.write("**Edit the values below**")
-                col1, col2 = st.columns(2)
-                with col1:
-                    new_desc = st.text_input("Product Name", value=current.get("Description", ""), key="edit_desc")
-                    new_supplier = st.text_input("Supplier", value=current.get("Supplier", ""), key="edit_sup")
-                    new_qty = st.number_input("Quantity", min_value=0.0, value=float(current.get("Quantity", 1)), key="edit_qty")
-                with col2:
-                    new_price = st.number_input("Unit Price (KES)", min_value=0.0, value=float(current.get("Price", 0)), key="edit_price")
-                    new_date = st.text_input("Date (YYYY-MM-DD)", value=str(current.get("Date", ""))[:10], key="edit_date")
-                    cat_list = ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"]
-                    current_cat = current.get("Category", "DRUG")
-                    cat_index = cat_list.index(current_cat) if current_cat in cat_list else 0
-                    new_category = st.selectbox("Category", cat_list, index=cat_index, key="edit_cat")
+            action = st.radio(
+                "What do you want to do?",
+                ["Delete a record", "Edit a record"],
+                horizontal=True,
+                key="edit_delete_action"
+            )
 
-                new_notes = st.text_area("Notes", value=current.get("Notes", ""), key="edit_notes")
+            row_id = st.number_input(
+                "Enter Row_ID",
+                min_value=0,
+                max_value=max(0, len(hist_df) - 1),
+                step=1,
+                key="edit_delete_row_id"
+            )
 
-                if st.button("Save Changes", type="primary"):
-                    history[row_id] = {
-                        "Date": new_date,
-                        "Description": new_desc.upper().strip(),
-                        "Supplier": new_supplier.upper().strip(),
-                        "Category": new_category,
-                        "Quantity": float(new_qty),
-                        "Price": float(new_price),
-                        "Amount": float(new_qty) * float(new_price),
-                        "Notes": new_notes,
-                        "Registered_On": current.get("Registered_On", datetime.now().strftime("%Y-%m-%d %H:%M"))
-                    }
-                    save_live_history(history)
-                    st.success(f"Row {row_id} updated. Switch menu or refresh to see the update.")
+            if action == "Delete a record":
+                st.error("This will permanently remove the record from the Price Tracker.")
+                confirm = st.checkbox("Yes, I want to delete this record")
+                if st.button("Delete This Record", type="primary", disabled=not confirm):
+                    new_history = [rec for i, rec in enumerate(history) if i != row_id]
+                    save_live_history(new_history)
+                    st.success(f"Row {row_id} deleted.")
                     st.balloons()
+                    st.rerun()
+
             else:
-                st.warning("Invalid Row_ID")
-    else:
-        st.info("No records available to edit or delete.")
+                if 0 <= row_id < len(history):
+                    current = history[row_id]
+                    st.write("**Change the values below**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        new_desc = st.text_input("Product Name", value=current.get("Description", ""), key="edit_desc")
+                        new_supplier = st.text_input("Supplier", value=current.get("Supplier", ""), key="edit_sup")
+                        new_qty = st.number_input("Quantity", min_value=0.0, value=float(current.get("Quantity", 1)), key="edit_qty")
+                    with col2:
+                        new_price = st.number_input("Unit Price (KES)", min_value=0.0, value=float(current.get("Price", 0)), key="edit_price")
+                        new_date = st.text_input("Date (YYYY-MM-DD)", value=str(current.get("Date", ""))[:10], key="edit_date")
+                        cat_list = ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"]
+                        current_cat = current.get("Category", "DRUG")
+                        cat_index = cat_list.index(current_cat) if current_cat in cat_list else 0
+                        new_category = st.selectbox("Category", cat_list, index=cat_index, key="edit_cat")
+                    new_notes = st.text_area("Notes", value=current.get("Notes", ""), key="edit_notes")
+
+                    if st.button("Save Changes", type="primary"):
+                        history[row_id] = {
+                            "Date": new_date,
+                            "Description": new_desc.upper().strip(),
+                            "Supplier": new_supplier.upper().strip(),
+                            "Category": new_category,
+                            "Quantity": float(new_qty),
+                            "Price": float(new_price),
+                            "Amount": float(new_qty) * float(new_price),
+                            "Notes": new_notes,
+                            "Registered_On": current.get("Registered_On", datetime.now().strftime("%Y-%m-%d %H:%M"))
+                        }
+                        save_live_history(history)
+                        st.success(f"Row {row_id} updated.")
+                        st.balloons()
+                        st.rerun()
+                else:
+                    st.warning("Invalid Row_ID")
 
 # PAGE 3: View Product History
 elif menu == "View Product History":
     st.subheader("View Product History")
-
     live_history = load_live_history()
     live_products = []
     if live_history:
         live_df = pd.DataFrame(live_history)
         live_products = live_df["Description"].unique().tolist()
-
     all_products_for_dropdown = sorted(list(set(res["all_known_products"] + live_products)))
-
     selected_product = st.selectbox(
         "Select Product",
         options=all_products_for_dropdown,
         index=None,
         placeholder="Type to search or select a product..."
     )
-
     if selected_product:
         st.markdown(f"**Selected Product:** {selected_product}")
-
         if selected_product in res["product_supplier_history"]:
             st.write("**History from original records**")
             summary = pd.DataFrame(res["product_supplier_history"][selected_product]["summary"])
             details = pd.DataFrame(res["product_supplier_history"][selected_product]["details"])
-
             st.write("Summary by Supplier")
             st.dataframe(summary, use_container_width=True)
-
             st.write("Detailed Transactions")
             st.dataframe(details, use_container_width=True)
-
             st.download_button(
                 label="Download Original History (Excel)",
                 data=to_excel_download(details, "original_history.xlsx"),
                 file_name=f"Original_History_{selected_product[:40]}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-
         if live_history:
             live_df = pd.DataFrame(live_history)
             product_live = live_df[live_df["Description"] == selected_product].sort_values("Date")
-
             if len(product_live) > 0:
                 st.write("**Newly recorded purchases**")
                 st.dataframe(product_live, use_container_width=True)
-
                 live_summary = (
                     product_live.groupby("Supplier")
                     .agg(
@@ -486,7 +446,6 @@ elif menu == "View Product History":
                 )
                 st.write("Summary by Supplier")
                 st.dataframe(live_summary, use_container_width=True)
-
                 st.download_button(
                     label="Download Live History (Excel)",
                     data=to_excel_download(product_live, "live_history.xlsx"),
@@ -511,21 +470,17 @@ elif menu == "Search Products":
 # PAGE 5: New Products & Reports
 elif menu == "New Products & Reports":
     st.subheader("New Products & Reports")
-
     history = load_live_history()
     if history:
         df = pd.DataFrame(history)
-
         st.write("**All recorded purchases**")
         st.dataframe(df, use_container_width=True)
-
         st.download_button(
             "Download Full History (Excel)",
             data=to_excel_download(df, "full_history.xlsx"),
             file_name="Full_Live_Purchase_History.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
         new_prods = df[~df["Description"].isin(res["all_known_products"])]
         if len(new_prods) > 0:
             st.write("**New products only**")
