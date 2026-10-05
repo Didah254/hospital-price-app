@@ -39,6 +39,37 @@ except Exception as e:
     st.error(f"Could not load files from the price_models folder.\n\n{e}")
     st.stop()
 
+# ========== NEW: Promoted products (auto-added after 10 purchases) ==========
+PROMOTED_PATH = "price_models/promoted_products.joblib"
+
+def load_promoted_products():
+    if os.path.exists(PROMOTED_PATH):
+        return joblib.load(PROMOTED_PATH)
+    return []
+
+def save_promoted_products(promoted_list):
+    joblib.dump(promoted_list, PROMOTED_PATH)
+
+def get_all_known_products():
+    """Original known products + automatically promoted ones"""
+    promoted = load_promoted_products()
+    return sorted(list(set(res["all_known_products"] + promoted)))
+
+def check_and_promote_product(description):
+    """Automatically promote a product to known list once it reaches 10 purchases"""
+    description = str(description).upper().strip()
+    prices, _ = get_product_price_history(description)
+    total_purchases = len(prices)
+
+    if total_purchases >= 10:
+        promoted = load_promoted_products()
+        if description not in promoted and description not in res["all_known_products"]:
+            promoted.append(description)
+            save_promoted_products(promoted)
+            return True  # was newly promoted
+    return False
+# ===========================================================================
+
 def load_live_history():
     path = "price_models/live_purchase_history.joblib"
     if os.path.exists(path):
@@ -96,6 +127,11 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
     hist_min = min(hist_prices) if hist_prices else None
     hist_max = max(hist_prices) if hist_prices else None
     is_new_supplier = supplier not in [s.upper() for s in hist_suppliers]
+    
+    unique_suppliers = list(set([s for s in hist_suppliers if s]))
+    times_purchased = len(hist_prices)
+    suppliers_count = len(unique_suppliers)
+
     # Model prediction (existing logic)
     if description in res["low_products"]:
         model = res["model_low"]
@@ -131,8 +167,11 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
             "Historical Min": round(float(hist_min), 2) if hist_min else None,
             "Historical Max": round(float(hist_max), 2) if hist_max else None,
             "Is New Supplier": is_new_supplier,
-            "Previous Suppliers": list(set(hist_suppliers))
+            "Previous Suppliers": unique_suppliers,
+            "Times Purchased": times_purchased,          # NEW
+            "Suppliers Count": suppliers_count           # NEW
         }
+
     try:
         desc_enc = le_desc.transform([description])[0]
     except:
@@ -152,9 +191,12 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
                 "Historical Min": round(float(hist_min), 2),
                 "Historical Max": round(float(hist_max), 2),
                 "Is New Supplier": is_new_supplier,
-                "Previous Suppliers": list(set(hist_suppliers))
+                "Previous Suppliers": unique_suppliers,
+                "Times Purchased": times_purchased,
+                "Suppliers Count": suppliers_count
             }
         return predict_from_history(description, proposed_price)
+
     try:
         sup_enc = le_sup.transform([supplier])[0]
     except:
@@ -163,6 +205,7 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         cat_enc = le_cat.transform([category.upper()])[0]
     except:
         cat_enc = 0
+
     X = np.array([[desc_enc, quantity, month, sup_enc, cat_enc]])
     expected = model.predict(X)[0]
     variance = ((proposed_price - expected) / expected) * 100
@@ -172,6 +215,7 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         status = "MEDIUM – Ask for justification"
     else:
         status = "ACCEPTABLE"
+
     result = {
         "Product Group": group,
         "Expected fair price (KES)": round(float(expected), 2),
@@ -185,7 +229,9 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         result["Historical Average"] = round(float(hist_mean), 2)
         result["Historical Min"] = round(float(hist_min), 2)
         result["Historical Max"] = round(float(hist_max), 2)
-        result["Previous Suppliers"] = list(set(hist_suppliers))
+        result["Previous Suppliers"] = unique_suppliers
+        result["Times Purchased"] = times_purchased
+        result["Suppliers Count"] = suppliers_count
         # Extra warning if new supplier is significantly higher than historical
         if is_new_supplier and hist_median and proposed_price > hist_median * 1.15:
             result["Recommendation"] = "HIGH – New supplier price is much higher than previous suppliers"
@@ -218,7 +264,9 @@ def predict_from_history(description, proposed_price):
         "Average price (KES)": round(float(product_df["Price"].mean()), 2),
         "Proposed price (KES)": proposed_price,
         "Difference %": round(float(variance), 1),
-        "Recommendation": status
+        "Recommendation": status,
+        "Times Purchased": len(product_df),
+        "Suppliers Count": int(product_df["Supplier"].nunique())
     }
 
 def to_excel_download(df, filename):
@@ -233,13 +281,22 @@ def show_clean_result(result):
         if result.get("Recorded prices"):
             st.write("Recorded prices so far: " + ", ".join([str(p) for p in result["Recorded prices"]]))
         return
+
     st.markdown("### Result")
     st.write(f"**Product Group:** {result.get('Product Group', 'N/A')}")
+
+    # ========== NEW: Clear message for history-based / new products ==========
+    if result.get("Times Purchased") is not None and result.get("Suppliers Count") is not None:
+        st.info(f"**Based on {result['Times Purchased']} purchases from {result['Suppliers Count']} different suppliers**")
+    # ========================================================================
+
     st.write(f"**Expected Fair Price:** KES {result.get('Expected fair price (KES)', result.get('Median price (KES)', 'N/A'))}")
     st.write(f"**Proposed Price:** KES {result.get('Proposed price (KES)', 'N/A')}")
     st.write(f"**Difference:** {result.get('Difference %', 'N/A')}%")
+
     if result.get("Is New Supplier"):
         st.warning("This is a **new supplier** for this product.")
+
     if result.get("Historical Median"):
         st.markdown("#### Comparison with previous suppliers")
         col1, col2, col3, col4 = st.columns(4)
@@ -249,6 +306,7 @@ def show_clean_result(result):
         col4.metric("Highest Previous", f"KES {result['Historical Max']}")
         if result.get("Previous Suppliers"):
             st.write("**Previous suppliers:** " + ", ".join(result["Previous Suppliers"]))
+
     recommendation = result.get("Recommendation", "")
     if "HIGH" in recommendation:
         st.error(f"**Recommendation:** {recommendation}")
@@ -276,9 +334,11 @@ st.markdown("---")
 # PAGE 1: Check Fair Price
 if menu == "Check Fair Price":
     st.subheader("Check Fair Price")
+    # Use promoted + original known products
+    all_known = get_all_known_products()
     selected_product = st.selectbox(
         "Select Product",
-        options=res["all_known_products"],
+        options=all_known,
         index=None,
         placeholder="Type to search or select a product..."
     )
@@ -342,7 +402,7 @@ elif menu == "Register Purchase":
             "Quantity", "Price", "Amount", "Notes", "Registered_On"
         ])
     live_products = live_df["Description"].unique().tolist() if len(live_df) > 0 else []
-    all_products = sorted(list(set(res["all_known_products"] + live_products)))
+    all_products = sorted(list(set(get_all_known_products() + live_products)))
     # Price Tracker
     st.markdown("### Product Price Tracker")
     if len(live_df) > 0:
@@ -385,11 +445,8 @@ elif menu == "Register Purchase":
             already = len(live_df[live_df["Description"] == product_to_save])
         st.write(f"This product has been recorded **{already}** time(s). The new price will appear as Price_{already+1}.")
         # ===== MODIFIED SUPPLIER SECTION =====
-        # Searchable supplier dropdown (all known + new) + last suppliers of this product with details
         all_sups = get_all_suppliers()
-        # Collect previous supply records for this product (original + live)
         previous_records = []
-        # From original history
         if product_to_save in res["product_supplier_history"]:
             for row in res["product_supplier_history"][product_to_save].get("details", []):
                 previous_records.append({
@@ -399,7 +456,6 @@ elif menu == "Register Purchase":
                     "Category": row.get("Category", "DRUG"),
                     "Date": row.get("Date", "")
                 })
-        # From live history
         live = load_live_history()
         for rec in live:
             if str(rec.get("Description", "")).upper().strip() == product_to_save:
@@ -410,15 +466,12 @@ elif menu == "Register Purchase":
                     "Category": rec.get("Category", "DRUG"),
                     "Date": rec.get("Date", "")
                 })
-        # Remove empty suppliers and get unique supplier names
         previous_suppliers_for_product = sorted(list(set(
             [r["Supplier"] for r in previous_records if r["Supplier"]]
         )))
-        # Show detailed last supplies
         if previous_records:
             st.markdown("#### Last times this product was supplied")
             prev_df = pd.DataFrame(previous_records)
-            # Keep only useful columns and sort by date if possible
             display_cols = [c for c in ["Date", "Supplier", "Quantity", "Price", "Category"] if c in prev_df.columns]
             prev_df = prev_df[display_cols].drop_duplicates()
             st.dataframe(prev_df, use_container_width=True)
@@ -462,9 +515,19 @@ elif menu == "Register Purchase":
                 }
                 history.append(record)
                 save_live_history(history)
-                st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
-                st.balloons()
+
+                # ========== NEW: Auto-promote after 10 purchases ==========
+                was_promoted = check_and_promote_product(product_to_save)
+                if was_promoted:
+                    st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
+                    st.balloons()
+                    st.info(f"🎉 **{product_to_save}** has reached 10+ purchases and has been automatically added to the known products list!")
+                else:
+                    st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
+                    st.balloons()
+                # ========================================================
                 st.rerun()
+
     # Edit / Delete – only open when you need to fix a mistake
     st.markdown("---")
     with st.expander("Fix a mistake (Edit or Delete)", expanded=False):
@@ -545,7 +608,7 @@ elif menu == "View Product History":
     if live_history:
         live_df = pd.DataFrame(live_history)
         live_products = live_df["Description"].unique().tolist()
-    all_products_for_dropdown = sorted(list(set(res["all_known_products"] + live_products)))
+    all_products_for_dropdown = sorted(list(set(get_all_known_products() + live_products)))
     selected_product = st.selectbox(
         "Select Product",
         options=all_products_for_dropdown,
@@ -605,7 +668,8 @@ elif menu == "View Product History":
 elif menu == "Search Products":
     st.subheader("Search Products")
     keyword = st.text_input("Type part of the product name")
-    results = [p for p in res["all_known_products"] if keyword.upper() in p] if keyword else res["all_known_products"][:100]
+    all_known = get_all_known_products()
+    results = [p for p in all_known if keyword.upper() in p] if keyword else all_known[:100]
     st.write(f"Showing {len(results)} products")
     st.dataframe(pd.DataFrame({"Product": results}), use_container_width=True)
 
@@ -623,7 +687,7 @@ elif menu == "New Products & Reports":
             file_name="Full_Live_Purchase_History.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        new_prods = df[~df["Description"].isin(res["all_known_products"])]
+        new_prods = df[~df["Description"].isin(get_all_known_products())]
         if len(new_prods) > 0:
             st.write("**New products only**")
             st.dataframe(new_prods, use_container_width=True)
