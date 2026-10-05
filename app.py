@@ -39,7 +39,7 @@ except Exception as e:
     st.error(f"Could not load files from the price_models folder.\n\n{e}")
     st.stop()
 
-# ========== NEW: Promoted products (auto-added after 10 purchases) ==========
+# ========== Promoted products (auto-added after 10 purchases) ==========
 PROMOTED_PATH = "price_models/promoted_products.joblib"
 
 def load_promoted_products():
@@ -58,17 +58,16 @@ def get_all_known_products():
 def check_and_promote_product(description):
     """Automatically promote a product to known list once it reaches 10 purchases"""
     description = str(description).upper().strip()
-    prices, _ = get_product_price_history(description)
+    prices, _, _ = get_product_price_history(description)
     total_purchases = len(prices)
-
     if total_purchases >= 10:
         promoted = load_promoted_products()
         if description not in promoted and description not in res["all_known_products"]:
             promoted.append(description)
             save_promoted_products(promoted)
-            return True  # was newly promoted
+            return True
     return False
-# ===========================================================================
+# ======================================================================
 
 def load_live_history():
     path = "price_models/live_purchase_history.joblib"
@@ -93,46 +92,86 @@ def get_all_suppliers():
     return sorted(list(suppliers))
 
 def get_product_price_history(description):
-    """Return combined historical prices for a product from original + live data"""
+    """Return combined historical prices + structured details"""
     description = str(description).upper().strip()
     prices = []
     suppliers = []
+    details = []
+
     # From original data
     if description in res["product_supplier_history"]:
-        details = res["product_supplier_history"][description].get("details", [])
-        for d in details:
+        for d in res["product_supplier_history"][description].get("details", []):
             try:
-                prices.append(float(d.get("Price", 0)))
-                suppliers.append(str(d.get("Supplier", "")).upper())
+                price = float(d.get("Price", 0))
+                qty = float(d.get("Quantity", 0) or 0)
+                sup = str(d.get("Supplier", "")).upper().strip()
+                prices.append(price)
+                suppliers.append(sup)
+                details.append({
+                    "Supplier": sup,
+                    "Price": price,
+                    "Quantity": qty,
+                    "Date": str(d.get("Date", ""))
+                })
             except:
                 pass
+
     # From live history
     live = load_live_history()
     for rec in live:
         if str(rec.get("Description", "")).upper().strip() == description:
             try:
-                prices.append(float(rec.get("Price", 0)))
-                suppliers.append(str(rec.get("Supplier", "")).upper())
+                price = float(rec.get("Price", 0))
+                qty = float(rec.get("Quantity", 0) or 0)
+                sup = str(rec.get("Supplier", "")).upper().strip()
+                prices.append(price)
+                suppliers.append(sup)
+                details.append({
+                    "Supplier": sup,
+                    "Price": price,
+                    "Quantity": qty,
+                    "Date": str(rec.get("Date", ""))
+                })
             except:
                 pass
-    return prices, suppliers
+
+    return prices, suppliers, details
 
 def predict_fair_price(description, quantity, supplier, month, proposed_price, category="DRUG"):
     description = str(description).upper().strip()
     supplier = str(supplier).upper().strip()
-    # Get historical prices for comparison
-    hist_prices, hist_suppliers = get_product_price_history(description)
+
+    hist_prices, hist_suppliers, hist_details = get_product_price_history(description)
+
     hist_median = np.median(hist_prices) if hist_prices else None
     hist_mean = np.mean(hist_prices) if hist_prices else None
     hist_min = min(hist_prices) if hist_prices else None
     hist_max = max(hist_prices) if hist_prices else None
     is_new_supplier = supplier not in [s.upper() for s in hist_suppliers]
-    
+
     unique_suppliers = list(set([s for s in hist_suppliers if s]))
     times_purchased = len(hist_prices)
     suppliers_count = len(unique_suppliers)
 
-    # Model prediction (existing logic)
+    # Supplier breakdown
+    supplier_breakdown = []
+    if hist_details:
+        df_hist = pd.DataFrame(hist_details)
+        breakdown = (
+            df_hist.groupby("Supplier")
+            .agg(
+                Times_Supplied=("Price", "count"),
+                Average_Price=("Price", "mean"),
+                Min_Price=("Price", "min"),
+                Max_Price=("Price", "max"),
+                Total_Quantity=("Quantity", "sum")
+            )
+            .round(2)
+            .reset_index()
+            .sort_values("Times_Supplied", ascending=False)
+        )
+        supplier_breakdown = breakdown.to_dict("records")
+
     if description in res["low_products"]:
         model = res["model_low"]
         le_desc, le_sup, le_cat = res["le_desc_low"], res["le_sup_low"], res["le_cat_low"]
@@ -146,7 +185,6 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         le_desc, le_sup, le_cat = res["le_desc_high"], res["le_sup_high"], res["le_cat_high"]
         group = "High-value"
     else:
-        # Fallback to history
         if len(hist_prices) < 3:
             return {
                 "Message": f"Only {len(hist_prices)} purchase(s) recorded so far. At least 3 are needed for a reliable estimate.",
@@ -168,14 +206,14 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
             "Historical Max": round(float(hist_max), 2) if hist_max else None,
             "Is New Supplier": is_new_supplier,
             "Previous Suppliers": unique_suppliers,
-            "Times Purchased": times_purchased,          # NEW
-            "Suppliers Count": suppliers_count           # NEW
+            "Times Purchased": times_purchased,
+            "Suppliers Count": suppliers_count,
+            "Supplier Breakdown": supplier_breakdown
         }
 
     try:
         desc_enc = le_desc.transform([description])[0]
     except:
-        # Fall back to history if product encoding fails
         if hist_median is not None:
             expected = hist_median
             variance = ((proposed_price - expected) / expected) * 100
@@ -193,14 +231,15 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
                 "Is New Supplier": is_new_supplier,
                 "Previous Suppliers": unique_suppliers,
                 "Times Purchased": times_purchased,
-                "Suppliers Count": suppliers_count
+                "Suppliers Count": suppliers_count,
+                "Supplier Breakdown": supplier_breakdown
             }
         return predict_from_history(description, proposed_price)
 
     try:
         sup_enc = le_sup.transform([supplier])[0]
     except:
-        sup_enc = 0  # unknown supplier
+        sup_enc = 0
     try:
         cat_enc = le_cat.transform([category.upper()])[0]
     except:
@@ -209,6 +248,7 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
     X = np.array([[desc_enc, quantity, month, sup_enc, cat_enc]])
     expected = model.predict(X)[0]
     variance = ((proposed_price - expected) / expected) * 100
+
     if variance > 20:
         status = "HIGH – Review required before approval"
     elif variance > 10:
@@ -224,6 +264,7 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         "Recommendation": status,
         "Is New Supplier": is_new_supplier
     }
+
     if hist_prices:
         result["Historical Median"] = round(float(hist_median), 2)
         result["Historical Average"] = round(float(hist_mean), 2)
@@ -232,11 +273,13 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         result["Previous Suppliers"] = unique_suppliers
         result["Times Purchased"] = times_purchased
         result["Suppliers Count"] = suppliers_count
-        # Extra warning if new supplier is significantly higher than historical
+        result["Supplier Breakdown"] = supplier_breakdown
+
         if is_new_supplier and hist_median and proposed_price > hist_median * 1.15:
             result["Recommendation"] = "HIGH – New supplier price is much higher than previous suppliers"
         elif is_new_supplier and hist_median and proposed_price > hist_median * 1.08:
             result["Recommendation"] = "MEDIUM – New supplier price is higher than previous average"
+
     return result
 
 def predict_from_history(description, proposed_price):
@@ -285,10 +328,22 @@ def show_clean_result(result):
     st.markdown("### Result")
     st.write(f"**Product Group:** {result.get('Product Group', 'N/A')}")
 
-    # ========== NEW: Clear message for history-based / new products ==========
+    # Enhanced message + supplier breakdown table
     if result.get("Times Purchased") is not None and result.get("Suppliers Count") is not None:
         st.info(f"**Based on {result['Times Purchased']} purchases from {result['Suppliers Count']} different suppliers**")
-    # ========================================================================
+
+        if result.get("Supplier Breakdown"):
+            st.markdown("#### Supplier Breakdown")
+            breakdown_df = pd.DataFrame(result["Supplier Breakdown"])
+            breakdown_df = breakdown_df.rename(columns={
+                "Supplier": "Supplier",
+                "Times_Supplied": "Times Supplied",
+                "Average_Price": "Avg Price (KES)",
+                "Min_Price": "Min Price (KES)",
+                "Max_Price": "Max Price (KES)",
+                "Total_Quantity": "Total Qty"
+            })
+            st.dataframe(breakdown_df, use_container_width=True)
 
     st.write(f"**Expected Fair Price:** KES {result.get('Expected fair price (KES)', result.get('Median price (KES)', 'N/A'))}")
     st.write(f"**Proposed Price:** KES {result.get('Proposed price (KES)', 'N/A')}")
@@ -304,8 +359,6 @@ def show_clean_result(result):
         col2.metric("Historical Average", f"KES {result['Historical Average']}")
         col3.metric("Lowest Previous", f"KES {result['Historical Min']}")
         col4.metric("Highest Previous", f"KES {result['Historical Max']}")
-        if result.get("Previous Suppliers"):
-            st.write("**Previous suppliers:** " + ", ".join(result["Previous Suppliers"]))
 
     recommendation = result.get("Recommendation", "")
     if "HIGH" in recommendation:
@@ -315,7 +368,7 @@ def show_clean_result(result):
     else:
         st.success(f"**Recommendation:** {recommendation}")
 
-# Menu
+# ====================== MENU ======================
 st.markdown("---")
 menu = st.selectbox(
     "Select Action",
@@ -334,7 +387,6 @@ st.markdown("---")
 # PAGE 1: Check Fair Price
 if menu == "Check Fair Price":
     st.subheader("Check Fair Price")
-    # Use promoted + original known products
     all_known = get_all_known_products()
     selected_product = st.selectbox(
         "Select Product",
@@ -346,12 +398,10 @@ if menu == "Check Fair Price":
     product_to_use = new_product.strip().upper() if new_product.strip() else selected_product
     if product_to_use:
         st.markdown(f"**Selected Product:** {product_to_use}")
-        # Show previous suppliers for this product
         if product_to_use in res["product_supplier_history"]:
             summary_df = pd.DataFrame(res["product_supplier_history"][product_to_use]["summary"])
             st.write("**Suppliers who previously supplied this product**")
             st.dataframe(summary_df, use_container_width=True)
-        # Also show live history suppliers
         live = load_live_history()
         live_df = pd.DataFrame(live) if live else pd.DataFrame()
         if len(live_df) > 0:
@@ -359,7 +409,6 @@ if menu == "Check Fair Price":
             if len(live_for_prod) > 0:
                 st.write("**Recent live purchases for this product**")
                 st.dataframe(live_for_prod[["Date", "Supplier", "Quantity", "Price"]].sort_values("Date", ascending=False), use_container_width=True)
-        # Supplier selection (searchable + new)
         all_sups = get_all_suppliers()
         supplier_options = all_sups + ["-- Add New Supplier --"]
         selected_supplier = st.selectbox("Select Supplier", options=supplier_options, index=None, placeholder="Type to search supplier...")
@@ -403,7 +452,7 @@ elif menu == "Register Purchase":
         ])
     live_products = live_df["Description"].unique().tolist() if len(live_df) > 0 else []
     all_products = sorted(list(set(get_all_known_products() + live_products)))
-    # Price Tracker
+
     st.markdown("### Product Price Tracker")
     if len(live_df) > 0:
         tracker_rows = []
@@ -426,8 +475,8 @@ elif menu == "Register Purchase":
         )
     else:
         st.info("No purchases recorded yet. Use the form below to add the first ones.")
+
     st.markdown("---")
-    # Add new purchase
     st.markdown("### Add New Purchase")
     selected_product = st.selectbox(
         "Search and select product",
@@ -444,7 +493,7 @@ elif menu == "Register Purchase":
         if len(live_df) > 0:
             already = len(live_df[live_df["Description"] == product_to_save])
         st.write(f"This product has been recorded **{already}** time(s). The new price will appear as Price_{already+1}.")
-        # ===== MODIFIED SUPPLIER SECTION =====
+
         all_sups = get_all_suppliers()
         previous_records = []
         if product_to_save in res["product_supplier_history"]:
@@ -488,7 +537,7 @@ elif menu == "Register Purchase":
         )
         if selected_supplier == "-- Add New Supplier --":
             selected_supplier = st.text_input("Enter new supplier name", key="tracker_new_sup")
-        # ===== END OF MODIFIED SUPPLIER SECTION =====
+
         col1, col2 = st.columns(2)
         with col1:
             qty = st.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, key="tracker_qty")
@@ -497,6 +546,7 @@ elif menu == "Register Purchase":
             purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
             category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"], key="tracker_cat")
         notes = st.text_area("Notes (optional)", key="tracker_notes")
+
         if st.button("Save Purchase", type="primary"):
             if not product_to_save or not selected_supplier or price <= 0:
                 st.warning("Please fill Product, Supplier and a valid Price.")
@@ -516,19 +566,16 @@ elif menu == "Register Purchase":
                 history.append(record)
                 save_live_history(history)
 
-                # ========== NEW: Auto-promote after 10 purchases ==========
                 was_promoted = check_and_promote_product(product_to_save)
                 if was_promoted:
                     st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
                     st.balloons()
-                    st.info(f"🎉 **{product_to_save}** has reached 10+ purchases and has been automatically added to the known products list!")
+                    st.info(f"🎉 **{product_to_save}** has reached 5+ purchases and has been automatically added to the known products list!")
                 else:
                     st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
                     st.balloons()
-                # ========================================================
                 st.rerun()
 
-    # Edit / Delete – only open when you need to fix a mistake
     st.markdown("---")
     with st.expander("Fix a mistake (Edit or Delete)", expanded=False):
         st.warning("Only open this if you entered something wrong. Deleting removes the record for good.")
@@ -700,15 +747,12 @@ elif menu == "New Products & Reports":
     else:
         st.info("No purchases have been recorded yet.")
 
-# PAGE 6: Most Frequently Purchased Products  (MODIFIED - Original + Live)
+# PAGE 6: Most Frequent Products
 elif menu == "Most Frequent Products":
     st.subheader("Most Frequently Purchased Products")
     st.caption("Products ranked by how many times they have been purchased (Original + Live history). Shows quantity, price range, suppliers and last purchase date.")
 
-    # ---------- Combine Original + Live data ----------
     all_records = []
-
-    # 1. From original history
     for product, data in res["product_supplier_history"].items():
         for row in data.get("details", []):
             all_records.append({
@@ -719,8 +763,6 @@ elif menu == "Most Frequent Products":
                 "Date": str(row.get("Date", "")),
                 "Source": "Original"
             })
-
-    # 2. From live history
     live = load_live_history()
     for rec in live:
         all_records.append({
@@ -736,8 +778,6 @@ elif menu == "Most Frequent Products":
         st.info("No purchases recorded yet (neither original nor live).")
     else:
         df = pd.DataFrame(all_records)
-
-        # Overall frequency summary
         summary = (
             df.groupby("Description")
             .agg(
@@ -753,15 +793,11 @@ elif menu == "Most Frequent Products":
             .reset_index()
             .sort_values("Times_Purchased", ascending=False)
         )
-
-        # Search filter
         search = st.text_input("Search product name", placeholder="Type to filter...")
         if search:
             summary = summary[summary["Description"].str.contains(search.upper(), na=False)]
-
         st.write(f"Showing {len(summary)} products (Original + Live data)")
         st.dataframe(summary, use_container_width=True)
-
         st.download_button(
             "Download Frequency Report (Excel)",
             data=to_excel_download(summary, "frequent_products.xlsx"),
@@ -769,7 +805,6 @@ elif menu == "Most Frequent Products":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-        # Detailed breakdown per product → per supplier
         st.markdown("---")
         st.markdown("### Detailed breakdown by supplier")
         selected_for_detail = st.selectbox(
