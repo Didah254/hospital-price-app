@@ -384,29 +384,48 @@ elif menu == "Register Purchase":
         if len(live_df) > 0:
             already = len(live_df[live_df["Description"] == product_to_save])
         st.write(f"This product has been recorded **{already}** time(s). The new price will appear as Price_{already+1}.")
-
         # ===== MODIFIED SUPPLIER SECTION =====
-        # Searchable supplier dropdown (all known + new) + last suppliers of this product
+        # Searchable supplier dropdown (all known + new) + last suppliers of this product with details
         all_sups = get_all_suppliers()
-
-        # Get suppliers who previously supplied this product (original + live)
-        previous_suppliers_for_product = []
+        # Collect previous supply records for this product (original + live)
+        previous_records = []
+        # From original history
         if product_to_save in res["product_supplier_history"]:
-            for row in res["product_supplier_history"][product_to_save].get("summary", []):
-                previous_suppliers_for_product.append(str(row.get("Supplier", "")).upper().strip())
+            for row in res["product_supplier_history"][product_to_save].get("details", []):
+                previous_records.append({
+                    "Supplier": str(row.get("Supplier", "")).upper().strip(),
+                    "Price": row.get("Price", ""),
+                    "Quantity": row.get("Quantity", ""),
+                    "Category": row.get("Category", "DRUG"),
+                    "Date": row.get("Date", "")
+                })
+        # From live history
         live = load_live_history()
         for rec in live:
             if str(rec.get("Description", "")).upper().strip() == product_to_save:
-                previous_suppliers_for_product.append(str(rec.get("Supplier", "")).upper().strip())
-        previous_suppliers_for_product = sorted(list(set([s for s in previous_suppliers_for_product if s])))
-
-        # Show last suppliers first in the dropdown
-        if previous_suppliers_for_product:
+                previous_records.append({
+                    "Supplier": str(rec.get("Supplier", "")).upper().strip(),
+                    "Price": rec.get("Price", ""),
+                    "Quantity": rec.get("Quantity", ""),
+                    "Category": rec.get("Category", "DRUG"),
+                    "Date": rec.get("Date", "")
+                })
+        # Remove empty suppliers and get unique supplier names
+        previous_suppliers_for_product = sorted(list(set(
+            [r["Supplier"] for r in previous_records if r["Supplier"]]
+        )))
+        # Show detailed last supplies
+        if previous_records:
+            st.markdown("#### Last times this product was supplied")
+            prev_df = pd.DataFrame(previous_records)
+            # Keep only useful columns and sort by date if possible
+            display_cols = [c for c in ["Date", "Supplier", "Quantity", "Price", "Category"] if c in prev_df.columns]
+            prev_df = prev_df[display_cols].drop_duplicates()
+            st.dataframe(prev_df, use_container_width=True)
             st.info(f"**Last suppliers for this product:** {', '.join(previous_suppliers_for_product)}")
             supplier_options = previous_suppliers_for_product + [s for s in all_sups if s not in previous_suppliers_for_product] + ["-- Add New Supplier --"]
         else:
             supplier_options = all_sups + ["-- Add New Supplier --"]
-
         selected_supplier = st.selectbox(
             "Select Supplier (searchable) – last suppliers appear first",
             options=supplier_options,
@@ -417,7 +436,6 @@ elif menu == "Register Purchase":
         if selected_supplier == "-- Add New Supplier --":
             selected_supplier = st.text_input("Enter new supplier name", key="tracker_new_sup")
         # ===== END OF MODIFIED SUPPLIER SECTION =====
-
         col1, col2 = st.columns(2)
         with col1:
             qty = st.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, key="tracker_qty")
@@ -618,16 +636,42 @@ elif menu == "New Products & Reports":
     else:
         st.info("No purchases have been recorded yet.")
 
-# PAGE 6: Most Frequently Purchased Products  (MODIFIED)
+# PAGE 6: Most Frequently Purchased Products  (MODIFIED - Original + Live)
 elif menu == "Most Frequent Products":
     st.subheader("Most Frequently Purchased Products")
-    st.caption("Products ranked by how many times they have been purchased (live history). Shows quantity, price range, suppliers and last purchase date.")
+    st.caption("Products ranked by how many times they have been purchased (Original + Live history). Shows quantity, price range, suppliers and last purchase date.")
 
-    history = load_live_history()
-    if not history:
-        st.info("No purchases recorded yet.")
+    # ---------- Combine Original + Live data ----------
+    all_records = []
+
+    # 1. From original history
+    for product, data in res["product_supplier_history"].items():
+        for row in data.get("details", []):
+            all_records.append({
+                "Description": str(product).upper().strip(),
+                "Supplier": str(row.get("Supplier", "")).upper().strip(),
+                "Quantity": float(row.get("Quantity", 0) or 0),
+                "Price": float(row.get("Price", 0) or 0),
+                "Date": str(row.get("Date", "")),
+                "Source": "Original"
+            })
+
+    # 2. From live history
+    live = load_live_history()
+    for rec in live:
+        all_records.append({
+            "Description": str(rec.get("Description", "")).upper().strip(),
+            "Supplier": str(rec.get("Supplier", "")).upper().strip(),
+            "Quantity": float(rec.get("Quantity", 0) or 0),
+            "Price": float(rec.get("Price", 0) or 0),
+            "Date": str(rec.get("Date", "")),
+            "Source": "Live"
+        })
+
+    if not all_records:
+        st.info("No purchases recorded yet (neither original nor live).")
     else:
-        df = pd.DataFrame(history)
+        df = pd.DataFrame(all_records)
 
         # Overall frequency summary
         summary = (
@@ -639,7 +683,7 @@ elif menu == "Most Frequent Products":
                 Min_Price=("Price", "min"),
                 Max_Price=("Price", "max"),
                 Last_Purchased=("Date", "max"),
-                Suppliers=("Supplier", lambda x: ", ".join(sorted(set(x))))
+                Suppliers=("Supplier", lambda x: ", ".join(sorted(set([s for s in x if s]))))
             )
             .round(2)
             .reset_index()
@@ -651,7 +695,7 @@ elif menu == "Most Frequent Products":
         if search:
             summary = summary[summary["Description"].str.contains(search.upper(), na=False)]
 
-        st.write(f"Showing {len(summary)} products")
+        st.write(f"Showing {len(summary)} products (Original + Live data)")
         st.dataframe(summary, use_container_width=True)
 
         st.download_button(
