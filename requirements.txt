@@ -4,3 +4,7 @@ numpy
 joblib
 scikit-learn
 openpyxl
+google-auth
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
