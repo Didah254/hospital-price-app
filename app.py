@@ -5,11 +5,105 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os
+import time
+import uuid
 from io import BytesIO
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 st.set_page_config(page_title="Hospital Fair Price System", page_icon="🏥", layout="wide")
 st.title("Hospital Procurement – Fair Price System")
 
+# ====================== GOOGLE DRIVE HELPERS ======================
+def get_drive_service():
+    """Create Google Drive service using Streamlit secrets"""
+    try:
+        creds_info = json.loads(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=credentials)
+    except Exception as e:
+        st.warning(f"Google Drive connection error: {e}")
+        return None
+
+def upload_to_drive(local_path, drive_filename):
+    """Upload a file to the Hospital_Price_Data folder in Google Drive"""
+    try:
+        service = get_drive_service()
+        if service is None:
+            return False
+
+        folder_id = st.secrets["folder_id"]
+
+        query = f"name='{drive_filename}' and '{folder_id}' in parents and trashed=false"
+        results = service.files().list(q=query, fields="files(id)").execute()
+        files = results.get("files", [])
+
+        media = MediaFileUpload(local_path, resumable=True)
+
+        if files:
+            file_id = files[0]["id"]
+            service.files().update(fileId=file_id, media_body=media).execute()
+        else:
+            file_metadata = {
+                "name": drive_filename,
+                "parents": [folder_id]
+            }
+            service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields="id"
+            ).execute()
+        return True
+    except Exception as e:
+        st.warning(f"Backup to Google Drive failed: {e}")
+        return False
+
+def download_from_drive(drive_filename, local_path):
+    """Download a file from Google Drive if it exists"""
+    try:
+        service = get_drive_service()
+        if service is None:
+            return False
+
+        folder_id = st.secrets["folder_id"]
+        query = f"name='{drive_filename}' and '{folder_id}' in parents and trashed=false"
+        results = service.files().list(q=query, fields="files(id, name)").execute()
+        files = results.get("files", [])
+
+        if not files:
+            return False
+
+        file_id = files[0]["id"]
+        request = service.files().get_media(fileId=file_id)
+
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+        return True
+    except Exception as e:
+        st.warning(f"Could not download {drive_filename} from Drive: {e}")
+        return False
+
+def recover_files_from_drive():
+    """Try to restore important files from Google Drive if they are missing locally"""
+    files_to_recover = [
+        ("live_purchase_history.joblib", "price_models/live_purchase_history.joblib"),
+        ("Live_Purchase_History.xlsx", "price_models/Live_Purchase_History.xlsx"),
+        ("promoted_products.joblib", "price_models/promoted_products.joblib"),
+    ]
+    for drive_name, local_path in files_to_recover:
+        if not os.path.exists(local_path):
+            download_from_drive(drive_name, local_path)
+
+# ====================== LOAD MODELS ======================
 @st.cache_resource
 def load_resources():
     base = "price_models"
@@ -33,6 +127,9 @@ def load_resources():
         "product_supplier_history": joblib.load(f"{base}/product_supplier_history.joblib"),
     }
 
+# Recover history files from Google Drive before loading anything
+recover_files_from_drive()
+
 try:
     res = load_resources()
 except Exception as e:
@@ -41,6 +138,7 @@ except Exception as e:
 
 # ========== Promoted products (auto-added after 10 purchases) ==========
 PROMOTED_PATH = "price_models/promoted_products.joblib"
+LOCK_FILE = "price_models/history.lock"
 
 def load_promoted_products():
     if os.path.exists(PROMOTED_PATH):
@@ -49,14 +147,13 @@ def load_promoted_products():
 
 def save_promoted_products(promoted_list):
     joblib.dump(promoted_list, PROMOTED_PATH)
+    upload_to_drive(PROMOTED_PATH, "promoted_products.joblib")
 
 def get_all_known_products():
-    """Original known products + automatically promoted ones"""
     promoted = load_promoted_products()
     return sorted(list(set(res["all_known_products"] + promoted)))
 
 def check_and_promote_product(description):
-    """Automatically promote a product to known list once it reaches 10 purchases"""
     description = str(description).upper().strip()
     prices, _, _ = get_product_price_history(description)
     total_purchases = len(prices)
@@ -67,20 +164,58 @@ def check_and_promote_product(description):
             save_promoted_products(promoted)
             return True
     return False
-# ======================================================================
 
+# ======================================================================
 def load_live_history():
     path = "price_models/live_purchase_history.joblib"
     if os.path.exists(path):
         return joblib.load(path)
     return []
 
-def save_live_history(history):
-    joblib.dump(history, "price_models/live_purchase_history.joblib")
-    pd.DataFrame(history).to_excel("price_models/Live_Purchase_History.xlsx", index=False)
+def save_live_history(history, max_retries=8):
+    """
+    Safe save with file locking + automatic Google Drive backup.
+    """
+    lock_id = str(uuid.uuid4())
+    acquired = False
+    for attempt in range(max_retries):
+        try:
+            if not os.path.exists(LOCK_FILE):
+                with open(LOCK_FILE, "w") as f:
+                    f.write(lock_id)
+                time.sleep(0.05)
+                with open(LOCK_FILE, "r") as f:
+                    if f.read().strip() == lock_id:
+                        acquired = True
+                        break
+            else:
+                time.sleep(0.4 + attempt * 0.15)
+        except Exception:
+            time.sleep(0.3)
+
+    if not acquired:
+        return False
+
+    try:
+        # Local save
+        joblib.dump(history, "price_models/live_purchase_history.joblib")
+        pd.DataFrame(history).to_excel("price_models/Live_Purchase_History.xlsx", index=False)
+
+        # Backup to Google Drive
+        upload_to_drive("price_models/live_purchase_history.joblib", "live_purchase_history.joblib")
+        upload_to_drive("price_models/Live_Purchase_History.xlsx", "Live_Purchase_History.xlsx")
+
+        return True
+    finally:
+        try:
+            if os.path.exists(LOCK_FILE):
+                with open(LOCK_FILE, "r") as f:
+                    if f.read().strip() == lock_id:
+                        os.remove(LOCK_FILE)
+        except:
+            pass
 
 def get_all_suppliers():
-    """Collect unique suppliers from original history + live history"""
     suppliers = set()
     for prod, data in res["product_supplier_history"].items():
         for row in data.get("summary", []):
@@ -92,13 +227,10 @@ def get_all_suppliers():
     return sorted(list(suppliers))
 
 def get_product_price_history(description):
-    """Return combined historical prices + structured details"""
     description = str(description).upper().strip()
     prices = []
     suppliers = []
     details = []
-
-    # From original data
     if description in res["product_supplier_history"]:
         for d in res["product_supplier_history"][description].get("details", []):
             try:
@@ -115,8 +247,6 @@ def get_product_price_history(description):
                 })
             except:
                 pass
-
-    # From live history
     live = load_live_history()
     for rec in live:
         if str(rec.get("Description", "")).upper().strip() == description:
@@ -134,26 +264,20 @@ def get_product_price_history(description):
                 })
             except:
                 pass
-
     return prices, suppliers, details
 
 def predict_fair_price(description, quantity, supplier, month, proposed_price, category="DRUG"):
     description = str(description).upper().strip()
     supplier = str(supplier).upper().strip()
-
     hist_prices, hist_suppliers, hist_details = get_product_price_history(description)
-
     hist_median = np.median(hist_prices) if hist_prices else None
     hist_mean = np.mean(hist_prices) if hist_prices else None
     hist_min = min(hist_prices) if hist_prices else None
     hist_max = max(hist_prices) if hist_prices else None
     is_new_supplier = supplier not in [s.upper() for s in hist_suppliers]
-
     unique_suppliers = list(set([s for s in hist_suppliers if s]))
     times_purchased = len(hist_prices)
     suppliers_count = len(unique_suppliers)
-
-    # Supplier breakdown
     supplier_breakdown = []
     if hist_details:
         df_hist = pd.DataFrame(hist_details)
@@ -171,7 +295,6 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
             .sort_values("Times_Supplied", ascending=False)
         )
         supplier_breakdown = breakdown.to_dict("records")
-
     if description in res["low_products"]:
         model = res["model_low"]
         le_desc, le_sup, le_cat = res["le_desc_low"], res["le_sup_low"], res["le_cat_low"]
@@ -210,7 +333,6 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
             "Suppliers Count": suppliers_count,
             "Supplier Breakdown": supplier_breakdown
         }
-
     try:
         desc_enc = le_desc.transform([description])[0]
     except:
@@ -235,7 +357,6 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
                 "Supplier Breakdown": supplier_breakdown
             }
         return predict_from_history(description, proposed_price)
-
     try:
         sup_enc = le_sup.transform([supplier])[0]
     except:
@@ -244,18 +365,15 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         cat_enc = le_cat.transform([category.upper()])[0]
     except:
         cat_enc = 0
-
     X = np.array([[desc_enc, quantity, month, sup_enc, cat_enc]])
     expected = model.predict(X)[0]
     variance = ((proposed_price - expected) / expected) * 100
-
     if variance > 20:
         status = "HIGH – Review required before approval"
     elif variance > 10:
         status = "MEDIUM – Ask for justification"
     else:
         status = "ACCEPTABLE"
-
     result = {
         "Product Group": group,
         "Expected fair price (KES)": round(float(expected), 2),
@@ -264,7 +382,6 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         "Recommendation": status,
         "Is New Supplier": is_new_supplier
     }
-
     if hist_prices:
         result["Historical Median"] = round(float(hist_median), 2)
         result["Historical Average"] = round(float(hist_mean), 2)
@@ -274,12 +391,10 @@ def predict_fair_price(description, quantity, supplier, month, proposed_price, c
         result["Times Purchased"] = times_purchased
         result["Suppliers Count"] = suppliers_count
         result["Supplier Breakdown"] = supplier_breakdown
-
         if is_new_supplier and hist_median and proposed_price > hist_median * 1.15:
             result["Recommendation"] = "HIGH – New supplier price is much higher than previous suppliers"
         elif is_new_supplier and hist_median and proposed_price > hist_median * 1.08:
             result["Recommendation"] = "MEDIUM – New supplier price is higher than previous average"
-
     return result
 
 def predict_from_history(description, proposed_price):
@@ -324,14 +439,10 @@ def show_clean_result(result):
         if result.get("Recorded prices"):
             st.write("Recorded prices so far: " + ", ".join([str(p) for p in result["Recorded prices"]]))
         return
-
     st.markdown("### Result")
     st.write(f"**Product Group:** {result.get('Product Group', 'N/A')}")
-
-    # Enhanced message + supplier breakdown table
     if result.get("Times Purchased") is not None and result.get("Suppliers Count") is not None:
         st.info(f"**Based on {result['Times Purchased']} purchases from {result['Suppliers Count']} different suppliers**")
-
         if result.get("Supplier Breakdown"):
             st.markdown("#### Supplier Breakdown")
             breakdown_df = pd.DataFrame(result["Supplier Breakdown"])
@@ -344,14 +455,11 @@ def show_clean_result(result):
                 "Total_Quantity": "Total Qty"
             })
             st.dataframe(breakdown_df, use_container_width=True)
-
     st.write(f"**Expected Fair Price:** KES {result.get('Expected fair price (KES)', result.get('Median price (KES)', 'N/A'))}")
     st.write(f"**Proposed Price:** KES {result.get('Proposed price (KES)', 'N/A')}")
     st.write(f"**Difference:** {result.get('Difference %', 'N/A')}%")
-
     if result.get("Is New Supplier"):
         st.warning("This is a **new supplier** for this product.")
-
     if result.get("Historical Median"):
         st.markdown("#### Comparison with previous suppliers")
         col1, col2, col3, col4 = st.columns(4)
@@ -359,7 +467,6 @@ def show_clean_result(result):
         col2.metric("Historical Average", f"KES {result['Historical Average']}")
         col3.metric("Lowest Previous", f"KES {result['Historical Min']}")
         col4.metric("Highest Previous", f"KES {result['Historical Max']}")
-
     recommendation = result.get("Recommendation", "")
     if "HIGH" in recommendation:
         st.error(f"**Recommendation:** {recommendation}")
@@ -452,7 +559,6 @@ elif menu == "Register Purchase":
         ])
     live_products = live_df["Description"].unique().tolist() if len(live_df) > 0 else []
     all_products = sorted(list(set(get_all_known_products() + live_products)))
-
     st.markdown("### Product Price Tracker")
     if len(live_df) > 0:
         tracker_rows = []
@@ -475,7 +581,6 @@ elif menu == "Register Purchase":
         )
     else:
         st.info("No purchases recorded yet. Use the form below to add the first ones.")
-
     st.markdown("---")
     st.markdown("### Add New Purchase")
     selected_product = st.selectbox(
@@ -493,7 +598,6 @@ elif menu == "Register Purchase":
         if len(live_df) > 0:
             already = len(live_df[live_df["Description"] == product_to_save])
         st.write(f"This product has been recorded **{already}** time(s). The new price will appear as Price_{already+1}.")
-
         all_sups = get_all_suppliers()
         previous_records = []
         if product_to_save in res["product_supplier_history"]:
@@ -537,7 +641,6 @@ elif menu == "Register Purchase":
         )
         if selected_supplier == "-- Add New Supplier --":
             selected_supplier = st.text_input("Enter new supplier name", key="tracker_new_sup")
-
         col1, col2 = st.columns(2)
         with col1:
             qty = st.number_input("Quantity", min_value=1.0, value=1.0, step=1.0, key="tracker_qty")
@@ -546,7 +649,6 @@ elif menu == "Register Purchase":
             purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
             category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"], key="tracker_cat")
         notes = st.text_area("Notes (optional)", key="tracker_notes")
-
         if st.button("Save Purchase", type="primary"):
             if not product_to_save or not selected_supplier or price <= 0:
                 st.warning("Please fill Product, Supplier and a valid Price.")
@@ -564,18 +666,19 @@ elif menu == "Register Purchase":
                     "Registered_On": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }
                 history.append(record)
-                save_live_history(history)
-
-                was_promoted = check_and_promote_product(product_to_save)
-                if was_promoted:
-                    st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
-                    st.balloons()
-                    st.info(f"🎉 **{product_to_save}** has reached 5+ purchases and has been automatically added to the known products list!")
+                success = save_live_history(history)
+                if success:
+                    was_promoted = check_and_promote_product(product_to_save)
+                    if was_promoted:
+                        st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
+                        st.balloons()
+                        st.info(f"🎉 **{product_to_save}** has reached 3+ purchases and has been automatically added to the known products list!")
+                    else:
+                        st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
+                        st.balloons()
+                    st.rerun()
                 else:
-                    st.success(f"Saved. {product_to_save} now has {already+1} price record(s).")
-                    st.balloons()
-                st.rerun()
-
+                    st.error("Another user is currently saving data. Please wait 3–5 seconds and try again.")
     st.markdown("---")
     with st.expander("Fix a mistake (Edit or Delete)", expanded=False):
         st.warning("Only open this if you entered something wrong. Deleting removes the record for good.")
@@ -607,10 +710,13 @@ elif menu == "Register Purchase":
                 confirm = st.checkbox("Yes, I want to delete this record")
                 if st.button("Delete This Record", type="primary", disabled=not confirm):
                     new_history = [rec for i, rec in enumerate(history) if i != row_id]
-                    save_live_history(new_history)
-                    st.success(f"Row {row_id} deleted.")
-                    st.balloons()
-                    st.rerun()
+                    success = save_live_history(new_history)
+                    if success:
+                        st.success(f"Row {row_id} deleted.")
+                        st.balloons()
+                        st.rerun()
+                    else:
+                        st.error("Another user is currently saving. Please try again in a few seconds.")
             else:
                 if 0 <= row_id < len(history):
                     current = history[row_id]
@@ -640,10 +746,13 @@ elif menu == "Register Purchase":
                             "Notes": new_notes,
                             "Registered_On": current.get("Registered_On", datetime.now().strftime("%Y-%m-%d %H:%M"))
                         }
-                        save_live_history(history)
-                        st.success(f"Row {row_id} updated.")
-                        st.balloons()
-                        st.rerun()
+                        success = save_live_history(history)
+                        if success:
+                            st.success(f"Row {row_id} updated.")
+                            st.balloons()
+                            st.rerun()
+                        else:
+                            st.error("Another user is currently saving. Please try again in a few seconds.")
                 else:
                     st.warning("Invalid Row_ID")
 
@@ -751,7 +860,6 @@ elif menu == "New Products & Reports":
 elif menu == "Most Frequent Products":
     st.subheader("Most Frequently Purchased Products")
     st.caption("Products ranked by how many times they have been purchased (Original + Live history). Shows quantity, price range, suppliers and last purchase date.")
-
     all_records = []
     for product, data in res["product_supplier_history"].items():
         for row in data.get("details", []):
@@ -773,7 +881,6 @@ elif menu == "Most Frequent Products":
             "Date": str(rec.get("Date", "")),
             "Source": "Live"
         })
-
     if not all_records:
         st.info("No purchases recorded yet (neither original nor live).")
     else:
@@ -804,7 +911,6 @@ elif menu == "Most Frequent Products":
             file_name="Most_Frequent_Products.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
         st.markdown("---")
         st.markdown("### Detailed breakdown by supplier")
         selected_for_detail = st.selectbox(
