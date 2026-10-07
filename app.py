@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from io import BytesIO
-import json
+from collections import Counter
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
@@ -16,25 +16,19 @@ from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 st.set_page_config(page_title="Hospital Fair Price System", page_icon="🏥", layout="wide")
 st.title("Hospital Procurement – Fair Price System")
 
-# ====================== GOOGLE DRIVE HELPERS ======================
+# ====================== GOOGLE DRIVE HELPERS (COMPLETELY SILENT) ======================
 def get_drive_service():
-    """Create Google Drive service using Streamlit secrets"""
     try:
-        # st.secrets["gcp_service_account"] is already a dict (AttrDict)
-        # Do NOT use json.loads()
         creds_info = st.secrets["gcp_service_account"]
-        
         credentials = service_account.Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/drive"]
         )
         return build("drive", "v3", credentials=credentials)
-    except Exception as e:
-        st.warning(f"Google Drive connection error: {e}")
+    except Exception:
         return None
 
 def upload_to_drive(local_path, drive_filename):
-    """Upload a file to the Hospital_Price_Data folder in Google Drive"""
     try:
         service = get_drive_service()
         if service is None:
@@ -58,12 +52,10 @@ def upload_to_drive(local_path, drive_filename):
                 fields="id"
             ).execute()
         return True
-    except Exception as e:
-        st.warning(f"Backup to Google Drive failed: {e}")
+    except Exception:
         return False
 
 def download_from_drive(drive_filename, local_path):
-    """Download a file from Google Drive if it exists"""
     try:
         service = get_drive_service()
         if service is None:
@@ -83,12 +75,10 @@ def download_from_drive(drive_filename, local_path):
             while not done:
                 status, done = downloader.next_chunk()
         return True
-    except Exception as e:
-        st.warning(f"Could not download {drive_filename} from Drive: {e}")
+    except Exception:
         return False
 
 def recover_files_from_drive():
-    """Try to restore important files from Google Drive if they are missing locally"""
     files_to_recover = [
         ("live_purchase_history.joblib", "price_models/live_purchase_history.joblib"),
         ("Live_Purchase_History.xlsx", "price_models/Live_Purchase_History.xlsx"),
@@ -122,7 +112,6 @@ def load_resources():
         "product_supplier_history": joblib.load(f"{base}/product_supplier_history.joblib"),
     }
 
-# Recover history files from Google Drive before loading anything
 recover_files_from_drive()
 
 try:
@@ -131,7 +120,7 @@ except Exception as e:
     st.error(f"Could not load files from the price_models folder.\n\n{e}")
     st.stop()
 
-# ========== Promoted products (auto-added after 10 purchases) ==========
+# ========== Promoted products ==========
 PROMOTED_PATH = "price_models/promoted_products.joblib"
 LOCK_FILE = "price_models/history.lock"
 
@@ -152,7 +141,7 @@ def check_and_promote_product(description):
     description = str(description).upper().strip()
     prices, _, _ = get_product_price_history(description)
     total_purchases = len(prices)
-    if total_purchases >= 10:
+    if total_purchases >= 3:          # ← Changed from 10 to 3
         promoted = load_promoted_products()
         if description not in promoted and description not in res["all_known_products"]:
             promoted.append(description)
@@ -168,9 +157,6 @@ def load_live_history():
     return []
 
 def save_live_history(history, max_retries=8):
-    """
-    Safe save with file locking + automatic Google Drive backup.
-    """
     lock_id = str(uuid.uuid4())
     acquired = False
     for attempt in range(max_retries):
@@ -190,10 +176,8 @@ def save_live_history(history, max_retries=8):
     if not acquired:
         return False
     try:
-        # Local save
         joblib.dump(history, "price_models/live_purchase_history.joblib")
         pd.DataFrame(history).to_excel("price_models/Live_Purchase_History.xlsx", index=False)
-        # Backup to Google Drive
         upload_to_drive("price_models/live_purchase_history.joblib", "live_purchase_history.joblib")
         upload_to_drive("price_models/Live_Purchase_History.xlsx", "Live_Purchase_History.xlsx")
         return True
@@ -256,6 +240,30 @@ def get_product_price_history(description):
             except:
                 pass
     return prices, suppliers, details
+
+def get_product_category(description):
+    """Return the most common category for a product from original + live data"""
+    description = str(description).upper().strip()
+    categories = []
+
+    # From original data
+    if description in res["product_supplier_history"]:
+        for d in res["product_supplier_history"][description].get("details", []):
+            cat = str(d.get("Category", "")).upper().strip()
+            if cat:
+                categories.append(cat)
+
+    # From live history
+    live = load_live_history()
+    for rec in live:
+        if str(rec.get("Description", "")).upper().strip() == description:
+            cat = str(rec.get("Category", "")).upper().strip()
+            if cat:
+                categories.append(cat)
+
+    if categories:
+        return Counter(categories).most_common(1)[0][0]
+    return "DRUG"
 
 def predict_fair_price(description, quantity, supplier, month, proposed_price, category="DRUG"):
     description = str(description).upper().strip()
@@ -466,6 +474,85 @@ def show_clean_result(result):
     else:
         st.success(f"**Recommendation:** {recommendation}")
 
+# ====================== BACKUP & RESTORE SECTION ======================
+st.markdown("---")
+with st.expander("Backup & Restore Purchase History", expanded=False):
+    st.caption("Download a backup before updating the app. After updating, upload the backup to restore all records.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Download Backup")
+        history = load_live_history()
+        promoted = load_promoted_products()
+
+        if st.button("Download Full Backup (Excel)", type="primary", use_container_width=True):
+            if not history and not promoted:
+                st.warning("No data to download.")
+            else:
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    if history:
+                        pd.DataFrame(history).to_excel(writer, index=False, sheet_name="Live_Purchases")
+                    else:
+                        pd.DataFrame(columns=[
+                            "Date", "Description", "Supplier", "Category",
+                            "Quantity", "Price", "Amount", "Notes", "Registered_On"
+                        ]).to_excel(writer, index=False, sheet_name="Live_Purchases")
+
+                    pd.DataFrame({"Promoted_Product": promoted}).to_excel(
+                        writer, index=False, sheet_name="Promoted_Products"
+                    )
+
+                st.download_button(
+                    label="Click here to download the Excel backup",
+                    data=output.getvalue(),
+                    file_name=f"Hospital_Backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+                st.success(f"Backup ready — {len(history)} purchases + {len(promoted)} promoted products")
+
+    with col2:
+        st.markdown("#### Upload & Restore")
+        uploaded_file = st.file_uploader(
+            "Upload previous Excel backup",
+            type=["xlsx"],
+            help="Upload a previously downloaded backup to restore all records"
+        )
+
+        if uploaded_file is not None:
+            try:
+                live_df = pd.read_excel(uploaded_file, sheet_name="Live_Purchases")
+                promoted_df = pd.read_excel(uploaded_file, sheet_name="Promoted_Products")
+
+                restored_history = live_df.to_dict("records") if not live_df.empty else []
+                restored_promoted = promoted_df["Promoted_Product"].dropna().tolist() if "Promoted_Product" in promoted_df.columns else []
+
+                st.warning(
+                    f"This will restore:\n"
+                    f"- **{len(restored_history)}** purchase records\n"
+                    f"- **{len(restored_promoted)}** promoted products\n\n"
+                    f"Current data will be replaced."
+                )
+
+                if st.button("Confirm Restore", type="primary", use_container_width=True):
+                    success1 = save_live_history(restored_history)
+                    save_promoted_products(restored_promoted)
+
+                    if success1:
+                        st.success("Restore completed successfully!")
+                        st.balloons()
+                        time.sleep(1.5)
+                        st.rerun()
+                    else:
+                        st.error("Could not save. Please try again in a few seconds.")
+
+            except Exception as e:
+                st.error(f"Error reading the backup file: {e}")
+
+    st.caption(f"Current live records: **{len(load_live_history())}** | Promoted products: **{len(load_promoted_products())}**")
+
 # ====================== MENU ======================
 st.markdown("---")
 menu = st.selectbox(
@@ -496,6 +583,11 @@ if menu == "Check Fair Price":
     product_to_use = new_product.strip().upper() if new_product.strip() else selected_product
     if product_to_use:
         st.markdown(f"**Selected Product:** {product_to_use}")
+        
+        # Show category automatically
+        product_category = get_product_category(product_to_use)
+        st.info(f"**Category:** {product_category}")
+
         if product_to_use in res["product_supplier_history"]:
             summary_df = pd.DataFrame(res["product_supplier_history"][product_to_use]["summary"])
             st.write("**Suppliers who previously supplied this product**")
@@ -524,7 +616,7 @@ if menu == "Check Fair Price":
                 st.warning("Please enter Supplier and Proposed Price.")
             else:
                 result = predict_fair_price(
-                    product_to_use, quantity, selected_supplier, month, proposed_price
+                    product_to_use, quantity, selected_supplier, month, proposed_price, category=product_category
                 )
                 show_clean_result(result)
                 report_df = pd.DataFrame([result])
@@ -638,7 +730,22 @@ elif menu == "Register Purchase":
             price = st.number_input("Unit Price (KES)", min_value=0.0, value=0.0, step=0.01, key="tracker_price")
         with col2:
             purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
-            category = st.selectbox("Category", ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"], key="tracker_cat")
+            
+            # Auto-detect category
+            suggested_category = get_product_category(product_to_save)
+            category_options = ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"]
+            try:
+                default_index = category_options.index(suggested_category)
+            except:
+                default_index = 0
+                
+            category = st.selectbox(
+                "Category (auto-detected)",
+                category_options,
+                index=default_index,
+                key="tracker_cat",
+                help=f"Auto-detected as {suggested_category}. You can change it if needed."
+            )
         notes = st.text_area("Notes (optional)", key="tracker_notes")
         if st.button("Save Purchase", type="primary"):
             if not product_to_save or not selected_supplier or price <= 0:
@@ -764,6 +871,11 @@ elif menu == "View Product History":
     )
     if selected_product:
         st.markdown(f"**Selected Product:** {selected_product}")
+        
+        # Show category
+        product_category = get_product_category(selected_product)
+        st.info(f"**Category:** {product_category}")
+
         if selected_product in res["product_supplier_history"]:
             st.write("**History from original records**")
             summary = pd.DataFrame(res["product_supplier_history"][selected_product]["summary"])
