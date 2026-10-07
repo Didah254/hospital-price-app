@@ -141,7 +141,7 @@ def check_and_promote_product(description):
     description = str(description).upper().strip()
     prices, _, _ = get_product_price_history(description)
     total_purchases = len(prices)
-    if total_purchases >= 3:          # ← Changed from 10 to 3
+    if total_purchases >= 3:
         promoted = load_promoted_products()
         if description not in promoted and description not in res["all_known_products"]:
             promoted.append(description)
@@ -242,27 +242,59 @@ def get_product_price_history(description):
     return prices, suppliers, details
 
 def get_product_category(description):
-    """Return the most common category for a product from original + live data"""
+    """Return the most common category for a product from original + live data.
+       Falls back to smart keyword detection if no category is found."""
     description = str(description).upper().strip()
     categories = []
 
-    # From original data
+    # 1. From original data
     if description in res["product_supplier_history"]:
         for d in res["product_supplier_history"][description].get("details", []):
             cat = str(d.get("Category", "")).upper().strip()
-            if cat:
+            if cat and cat not in ["", "NAN", "NONE", "NULL"]:
                 categories.append(cat)
 
-    # From live history
+    # 2. From live history
     live = load_live_history()
     for rec in live:
         if str(rec.get("Description", "")).upper().strip() == description:
             cat = str(rec.get("Category", "")).upper().strip()
-            if cat:
+            if cat and cat not in ["", "NAN", "NONE", "NULL"]:
                 categories.append(cat)
 
     if categories:
         return Counter(categories).most_common(1)[0][0]
+
+    # 3. Smart keyword-based fallback
+    name = description
+
+    consumable_keywords = [
+        "TRAY", "ENVELOP", "ENVELOPE", "GLOVE", "GLOVES", "MASK", "MASKS",
+        "SYRINGE", "NEEDLE", "CATHETER", "TUBE", "BAG", "BANDAGE", "GAUZE",
+        "COTTON", "SWAB", "DRESSING", "PLASTER", "TAPE", "SHEET", "COVER",
+        "APRON", "GOWN", "CAP", "SHOE", "BOOT", "SUTURE", "BLADE", "SCALPEL",
+        "FORCEPS", "CLAMP", "SCISSOR", "CONTAINER", "BOTTLE", "VIAL", "AMPOULE"
+    ]
+    for kw in consumable_keywords:
+        if kw in name:
+            return "CONSUMABLE"
+
+    lab_keywords = [
+        "REAGENT", "TEST", "KIT", "STRIP", "SLIDE", "CULTURE", "AGAR",
+        "PIPETTE", "SAMPLE", "SPECIMEN", "ANALYZER", "CASSETTE"
+    ]
+    for kw in lab_keywords:
+        if kw in name:
+            return "LAB"
+
+    theatre_keywords = [
+        "SUTURE", "BLADE", "SCALPEL", "FORCEPS", "CLAMP", "RETRACTOR",
+        "SCISSOR", "NEEDLE HOLDER", "SURGICAL", "OPERATING", "THEATRE"
+    ]
+    for kw in theatre_keywords:
+        if kw in name:
+            return "THEATRE"
+
     return "DRUG"
 
 def predict_fair_price(description, quantity, supplier, month, proposed_price, category="DRUG"):
@@ -583,10 +615,21 @@ if menu == "Check Fair Price":
     product_to_use = new_product.strip().upper() if new_product.strip() else selected_product
     if product_to_use:
         st.markdown(f"**Selected Product:** {product_to_use}")
-        
-        # Show category automatically
-        product_category = get_product_category(product_to_use)
-        st.info(f"**Category:** {product_category}")
+
+        # Auto-detect + searchable category dropdown
+        suggested_category = get_product_category(product_to_use)
+        category_options = ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"]
+        try:
+            default_index = category_options.index(suggested_category)
+        except:
+            default_index = 0
+
+        product_category = st.selectbox(
+            "Category (auto-detected – you can change it)",
+            options=category_options,
+            index=default_index,
+            help=f"Auto-detected as **{suggested_category}**. Change it if needed."
+        )
 
         if product_to_use in res["product_supplier_history"]:
             summary_df = pd.DataFrame(res["product_supplier_history"][product_to_use]["summary"])
@@ -730,21 +773,21 @@ elif menu == "Register Purchase":
             price = st.number_input("Unit Price (KES)", min_value=0.0, value=0.0, step=0.01, key="tracker_price")
         with col2:
             purchase_date = st.date_input("Date of Purchase", value=datetime.now(), key="tracker_date")
-            
-            # Auto-detect category
+
+            # Auto-detect + searchable category dropdown
             suggested_category = get_product_category(product_to_save)
             category_options = ["DRUG", "CONSUMABLE", "LAB", "THEATRE", "OTHER"]
             try:
                 default_index = category_options.index(suggested_category)
             except:
                 default_index = 0
-                
+
             category = st.selectbox(
-                "Category (auto-detected)",
-                category_options,
+                "Category (auto-detected – you can change it)",
+                options=category_options,
                 index=default_index,
                 key="tracker_cat",
-                help=f"Auto-detected as {suggested_category}. You can change it if needed."
+                help=f"Auto-detected as **{suggested_category}**. Change it if needed."
             )
         notes = st.text_area("Notes (optional)", key="tracker_notes")
         if st.button("Save Purchase", type="primary"):
@@ -871,8 +914,7 @@ elif menu == "View Product History":
     )
     if selected_product:
         st.markdown(f"**Selected Product:** {selected_product}")
-        
-        # Show category
+
         product_category = get_product_category(selected_product)
         st.info(f"**Category:** {product_category}")
 
