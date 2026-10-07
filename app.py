@@ -20,7 +20,10 @@ st.title("Hospital Procurement – Fair Price System")
 def get_drive_service():
     """Create Google Drive service using Streamlit secrets"""
     try:
-        creds_info = json.loads(st.secrets["gcp_service_account"])
+        # st.secrets["gcp_service_account"] is already a dict (AttrDict)
+        # Do NOT use json.loads()
+        creds_info = st.secrets["gcp_service_account"]
+        
         credentials = service_account.Credentials.from_service_account_info(
             creds_info,
             scopes=["https://www.googleapis.com/auth/drive"]
@@ -36,15 +39,11 @@ def upload_to_drive(local_path, drive_filename):
         service = get_drive_service()
         if service is None:
             return False
-
         folder_id = st.secrets["folder_id"]
-
         query = f"name='{drive_filename}' and '{folder_id}' in parents and trashed=false"
         results = service.files().list(q=query, fields="files(id)").execute()
         files = results.get("files", [])
-
         media = MediaFileUpload(local_path, resumable=True)
-
         if files:
             file_id = files[0]["id"]
             service.files().update(fileId=file_id, media_body=media).execute()
@@ -69,18 +68,14 @@ def download_from_drive(drive_filename, local_path):
         service = get_drive_service()
         if service is None:
             return False
-
         folder_id = st.secrets["folder_id"]
         query = f"name='{drive_filename}' and '{folder_id}' in parents and trashed=false"
         results = service.files().list(q=query, fields="files(id, name)").execute()
         files = results.get("files", [])
-
         if not files:
             return False
-
         file_id = files[0]["id"]
         request = service.files().get_media(fileId=file_id)
-
         os.makedirs(os.path.dirname(local_path), exist_ok=True)
         with open(local_path, "wb") as f:
             downloader = MediaIoBaseDownload(f, request)
@@ -192,19 +187,15 @@ def save_live_history(history, max_retries=8):
                 time.sleep(0.4 + attempt * 0.15)
         except Exception:
             time.sleep(0.3)
-
     if not acquired:
         return False
-
     try:
         # Local save
         joblib.dump(history, "price_models/live_purchase_history.joblib")
         pd.DataFrame(history).to_excel("price_models/Live_Purchase_History.xlsx", index=False)
-
         # Backup to Google Drive
         upload_to_drive("price_models/live_purchase_history.joblib", "live_purchase_history.joblib")
         upload_to_drive("price_models/Live_Purchase_History.xlsx", "Live_Purchase_History.xlsx")
-
         return True
     finally:
         try:
