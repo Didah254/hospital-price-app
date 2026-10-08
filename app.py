@@ -141,7 +141,7 @@ def check_and_promote_product(description):
     description = str(description).upper().strip()
     prices, _, _ = get_product_price_history(description)
     total_purchases = len(prices)
-    if total_purchases >= 3:
+    if total_purchases >= 3:          # Changed from 10 to 3
         promoted = load_promoted_products()
         if description not in promoted and description not in res["all_known_products"]:
             promoted.append(description)
@@ -1004,81 +1004,161 @@ elif menu == "New Products & Reports":
 # PAGE 6: Most Frequent Products
 elif menu == "Most Frequent Products":
     st.subheader("Most Frequently Purchased Products")
-    st.caption("Products ranked by how many times they have been purchased (Original + Live history). Shows quantity, price range, suppliers and last purchase date.")
+    st.caption("Products ranked by how many times they have been purchased (Original + Live history). You can view All Time, by Year, or by Quarter. Category is auto-detected.")
+
+    # ---------- Collect all records with proper dates ----------
     all_records = []
+
+    # Original data
     for product, data in res["product_supplier_history"].items():
         for row in data.get("details", []):
+            date_str = str(row.get("Date", "")).strip()
+            try:
+                if len(date_str) >= 10:
+                    dt = pd.to_datetime(date_str[:10], errors="coerce")
+                else:
+                    dt = pd.to_datetime(date_str, errors="coerce")
+            except:
+                dt = pd.NaT
+
             all_records.append({
                 "Description": str(product).upper().strip(),
                 "Supplier": str(row.get("Supplier", "")).upper().strip(),
                 "Quantity": float(row.get("Quantity", 0) or 0),
                 "Price": float(row.get("Price", 0) or 0),
-                "Date": str(row.get("Date", "")),
+                "Date": dt,
                 "Source": "Original"
             })
+
+    # Live data
     live = load_live_history()
     for rec in live:
+        date_str = str(rec.get("Date", "")).strip()
+        try:
+            if len(date_str) >= 10:
+                dt = pd.to_datetime(date_str[:10], errors="coerce")
+            else:
+                dt = pd.to_datetime(date_str, errors="coerce")
+        except:
+            dt = pd.NaT
+
         all_records.append({
             "Description": str(rec.get("Description", "")).upper().strip(),
             "Supplier": str(rec.get("Supplier", "")).upper().strip(),
             "Quantity": float(rec.get("Quantity", 0) or 0),
             "Price": float(rec.get("Price", 0) or 0),
-            "Date": str(rec.get("Date", "")),
+            "Date": dt,
             "Source": "Live"
         })
+
     if not all_records:
         st.info("No purchases recorded yet (neither original nor live).")
     else:
         df = pd.DataFrame(all_records)
-        summary = (
-            df.groupby("Description")
-            .agg(
-                Times_Purchased=("Price", "count"),
-                Total_Quantity=("Quantity", "sum"),
-                Average_Price=("Price", "mean"),
-                Min_Price=("Price", "min"),
-                Max_Price=("Price", "max"),
-                Last_Purchased=("Date", "max"),
-                Suppliers=("Supplier", lambda x: ", ".join(sorted(set([s for s in x if s]))))
+        df = df.dropna(subset=["Date"])
+
+        if df.empty:
+            st.warning("No valid dates found in the records.")
+        else:
+            # ---------- Filter controls ----------
+            view_mode = st.radio(
+                "View Mode",
+                ["All Time", "By Year", "By Quarter"],
+                horizontal=True
             )
-            .round(2)
-            .reset_index()
-            .sort_values("Times_Purchased", ascending=False)
-        )
-        search = st.text_input("Search product name", placeholder="Type to filter...")
-        if search:
-            summary = summary[summary["Description"].str.contains(search.upper(), na=False)]
-        st.write(f"Showing {len(summary)} products (Original + Live data)")
-        st.dataframe(summary, use_container_width=True)
-        st.download_button(
-            "Download Frequency Report (Excel)",
-            data=to_excel_download(summary, "frequent_products.xlsx"),
-            file_name="Most_Frequent_Products.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        st.markdown("---")
-        st.markdown("### Detailed breakdown by supplier")
-        selected_for_detail = st.selectbox(
-            "Select a product to see how many times it was bought from each supplier",
-            options=summary["Description"].tolist(),
-            index=None,
-            placeholder="Choose a product..."
-        )
-        if selected_for_detail:
-            detail = (
-                df[df["Description"] == selected_for_detail]
-                .groupby("Supplier")
-                .agg(
-                    Times_Bought=("Price", "count"),
-                    Total_Quantity=("Quantity", "sum"),
-                    Average_Price=("Price", "mean"),
-                    Min_Price=("Price", "min"),
-                    Max_Price=("Price", "max"),
-                    Last_Bought=("Date", "max")
+
+            filtered_df = df.copy()
+
+            if view_mode == "By Year":
+                available_years = sorted(df["Date"].dt.year.dropna().unique(), reverse=True)
+                if available_years:
+                    selected_year = st.selectbox("Select Year", available_years)
+                    filtered_df = df[df["Date"].dt.year == selected_year]
+                else:
+                    st.warning("No years available.")
+                    filtered_df = pd.DataFrame()
+
+            elif view_mode == "By Quarter":
+                df["YearQuarter"] = df["Date"].dt.to_period("Q").astype(str)
+                available_quarters = sorted(df["YearQuarter"].dropna().unique(), reverse=True)
+
+                if available_quarters:
+                    selected_quarter = st.selectbox("Select Quarter (e.g. 2025Q3)", available_quarters)
+                    filtered_df = df[df["YearQuarter"] == selected_quarter]
+                else:
+                    st.warning("No quarters available.")
+                    filtered_df = pd.DataFrame()
+
+            # ---------- Summary table ----------
+            if filtered_df.empty:
+                st.info("No purchases found for the selected period.")
+            else:
+                summary = (
+                    filtered_df.groupby("Description")
+                    .agg(
+                        Times_Purchased=("Price", "count"),
+                        Total_Quantity=("Quantity", "sum"),
+                        Average_Price=("Price", "mean"),
+                        Min_Price=("Price", "min"),
+                        Max_Price=("Price", "max"),
+                        Last_Purchased=("Date", "max"),
+                        Suppliers=("Supplier", lambda x: ", ".join(sorted(set([s for s in x if s]))))
+                    )
+                    .round(2)
+                    .reset_index()
+                    .sort_values("Times_Purchased", ascending=False)
                 )
-                .round(2)
-                .reset_index()
-                .sort_values("Times_Bought", ascending=False)
-            )
-            st.write(f"**{selected_for_detail}** – purchases by supplier")
-            st.dataframe(detail, use_container_width=True)
+
+                # Add Category using the improved detection
+                summary["Category"] = summary["Description"].apply(get_product_category)
+
+                # Reorder columns to put Category near the front
+                cols = ["Description", "Category", "Times_Purchased", "Total_Quantity",
+                        "Average_Price", "Min_Price", "Max_Price", "Last_Purchased", "Suppliers"]
+                summary = summary[cols]
+
+                # Format last purchased date
+                summary["Last_Purchased"] = summary["Last_Purchased"].dt.strftime("%Y-%m-%d")
+
+                # Optional search
+                search = st.text_input("Search product name", placeholder="Type to filter...")
+                if search:
+                    summary = summary[summary["Description"].str.contains(search.upper(), na=False)]
+
+                st.write(f"Showing **{len(summary)}** products for the selected period")
+                st.dataframe(summary, use_container_width=True)
+
+                st.download_button(
+                    "Download Frequency Report (Excel)",
+                    data=to_excel_download(summary, "frequent_products.xlsx"),
+                    file_name=f"Most_Frequent_Products_{view_mode.replace(' ', '_')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+                st.markdown("---")
+                st.markdown("### Detailed breakdown by supplier")
+                selected_for_detail = st.selectbox(
+                    "Select a product to see how many times it was bought from each supplier",
+                    options=summary["Description"].tolist(),
+                    index=None,
+                    placeholder="Choose a product..."
+                )
+                if selected_for_detail:
+                    detail = (
+                        filtered_df[filtered_df["Description"] == selected_for_detail]
+                        .groupby("Supplier")
+                        .agg(
+                            Times_Bought=("Price", "count"),
+                            Total_Quantity=("Quantity", "sum"),
+                            Average_Price=("Price", "mean"),
+                            Min_Price=("Price", "min"),
+                            Max_Price=("Price", "max"),
+                            Last_Bought=("Date", "max")
+                        )
+                        .round(2)
+                        .reset_index()
+                        .sort_values("Times_Bought", ascending=False)
+                    )
+                    detail["Last_Bought"] = detail["Last_Bought"].dt.strftime("%Y-%m-%d")
+                    st.write(f"**{selected_for_detail}** – purchases by supplier")
+                    st.dataframe(detail, use_container_width=True)
